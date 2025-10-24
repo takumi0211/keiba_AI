@@ -1,0 +1,8 @@
+beautifulsoup4
+lxml
+lightgbm
+pandas
+requests
+scikit-learn
+tqdm
+selenium
