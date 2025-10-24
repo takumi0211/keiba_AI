@@ -17,6 +17,9 @@ import lightgbm as lgb
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import ParameterGrid, GroupKFold, train_test_split
 
+# 学習で利用する特徴量は config.py の `feature_columns` を参照する
+from src.config import feature_columns
+
 
 @dataclass
 class TrainingArtifacts:
@@ -86,11 +89,18 @@ def train_model(
     race_ids = df["race_id"]
     horse_numbers = df["馬番"]
 
-    # モデルで使用する特徴量の選定（TODO: 必要に応じて拡張・調整する余地がある）
-    feature_cols = ["馬番", "単勝", "人 気", "馬の体重", "体重変化", "平均賞金", "平均着順"]
+    # config.py の feature_columns から目的変数 "着順" を除外し、学習で使う列を決定
+    feature_cols = [col for col in feature_columns if col != "着順"]
+
+    # 欠損（存在しない）列があれば早めに検知
+    missing = [c for c in feature_cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing features in processed CSV: {missing}")
+
     features = df[feature_cols].copy()
-    # LightGBMカテゴリ処理のために馬番をカテゴリ型へ変換（one-hot後でも列順固定のために行う）
-    features["馬番"] = features["馬番"].astype("category")
+    # LightGBM カテゴリ処理のために、馬番が存在する場合のみカテゴリ化
+    if "馬番" in features.columns:
+        features["馬番"] = features["馬番"].astype("category")
     # 学習に渡しやすいようダミー変数化（カテゴリ列をバイナリ展開）
     X = pd.get_dummies(features, dtype=int)
     y = df["rank"]

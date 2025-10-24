@@ -23,7 +23,8 @@ from src.config import (
     prediction_top_k,
     prediction_threshold,
 )
-from src.scraping import scrape_horse_metrics
+from src.scraping import scrape_horse_metrics, scrape_horse_metrics_this_year
+from src.config import This_Year
 
 # 定数
 MAX_HORSE_NUMBER = 18
@@ -202,7 +203,6 @@ def create_prediction_result(df_original, y_proba):
     
     return df_result
 
-
 def main():
     """メイン処理"""
     # 出馬表をスクレイピング
@@ -223,7 +223,10 @@ def main():
     # 馬の過去成績を取得
     print("馬の過去成績を取得中...")
     horse_id_list = list(df['horse_id'].unique())
-    horse_prize, horse_rank = scrape_horse_metrics(horse_id_list, race_name)
+    if This_Year:
+        horse_prize, horse_rank = scrape_horse_metrics_this_year(horse_id_list, race_name)
+    else:
+        horse_prize, horse_rank = scrape_horse_metrics(horse_id_list, race_name)
     
     df['平均賞金'] = df['horse_id'].map(horse_prize)
     df['平均着順'] = df['horse_id'].map(horse_rank)

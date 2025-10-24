@@ -135,3 +135,57 @@ def scrape_horse_metrics(
         time.sleep(sleep_seconds)
 
     return horse_prize, horse_rank
+
+def scrape_horse_metrics_this_year(
+    horse_id_list: Iterable[str],
+    race_name: str,
+    *,
+    sleep_seconds: float = 1.0,
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """
+    今年用の簡易版メトリクス取得。
+    - 追加のフィルタは行わず、「今ある表」に表示されている行の数値をそのまま平均。
+    - `race_name` は互換のために受け取るが使用しない。
+    """
+    horse_prize: Dict[str, float] = {}
+    horse_rank: Dict[str, float] = {}
+
+    for horse_id in tqdm(horse_id_list):
+        url = f"https://db.netkeiba.com/horse/result/{horse_id}/"
+        response = requests.get(url, headers=DEFAULT_HEADERS, timeout=30)
+        response.encoding = "EUC-JP"
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        table = soup.find("table", class_="db_h_race_results")
+        if table is None:
+            print(f"成績テーブルが見つかりませんでした (horse_id={horse_id})。")
+            continue
+
+        column_headers = [th.get_text(strip=True) for th in table.find("tr").find_all("th")]
+
+        rows = []
+        for tr in table.find_all("tr")[1:]:
+            cells = [td.get_text(strip=True) for td in tr.find_all("td")]
+            if cells:
+                rows.append(cells)
+
+        df = pd.DataFrame(rows, columns=column_headers)
+        if df.empty:
+            print(f"有効な成績行が存在しません (horse_id={horse_id})。")
+            continue
+
+        # シンプルに表の数値を平均（賞金と着順）
+        # 賞金: 「-」は0扱い、カンマ除去して数値化
+        prize_series = (
+            df["賞金"].astype(str).replace("-", "0").replace(",", "", regex=True)
+        )
+        prize_numeric = pd.to_numeric(prize_series, errors="coerce").fillna(0)
+        horse_prize[horse_id] = float(prize_numeric.mean())
+
+        # 着順: 数値化できないものは0にして平均
+        rank_numeric = pd.to_numeric(df["着順"], errors="coerce").fillna(0).astype(int)
+        horse_rank[horse_id] = float(rank_numeric.mean())
+
+        time.sleep(sleep_seconds)
+
+    return horse_prize, horse_rank

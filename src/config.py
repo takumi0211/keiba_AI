@@ -31,20 +31,23 @@ feature_columns = [
     "馬番",
     "単勝",
     "人 気",
-    "馬の体重",
-    "体重変化",
+    # "馬の体重",
+    # "体重変化",
     "平均賞金",
     "平均着順",
 ]
 
 # モデルパス
-model_path = 'data/models/LightBGMモデル.joblib'
+model_path = 'data/models/LightBGMモデル_体重なし.joblib'
 
 # レースID(inference用)
-race_id = '201908040711'
+race_id = '202508030911'
 
 # 予測結果の選定方針（inference用）
 # 'top_k' なら確率上位k頭を『買うべき』にする。'threshold' なら確率が閾値以上を選定。
 prediction_strategy = 'top_k'  # 'top_k' | 'threshold'
 prediction_top_k = 5           # 上位何頭を買うか（'top_k' のとき有効）
 prediction_threshold = 0.3    # 閾値（'threshold' のとき有効）。18頭立ての事前確率 ~3/18 を目安に設定
+
+# 今年のレースかどうか
+This_Year = True
