@@ -72,24 +72,59 @@ def train_lightgbm() -> TrainingArtifacts:
     )
     print(f"  -> Train AUC: {artifacts.train_auc:.4f}")
     print(f"  -> Test AUC : {artifacts.test_auc:.4f}")
-    print(f"  -> モデルを {model_path.resolve()} に保存しました。")
+    # configの model_path は文字列のため、表示用に Path へ変換
+    print(f"  -> モデルを {Path(model_path).resolve()} に保存しました。")
 
     return artifacts
 
+def main(force: bool = False) -> Dict[str, float]:
+    """
+    パイプライン本体。既存データがあれば該当ステップをスキップする。
 
-def main() -> Dict[str, float]:
-    # レース結果をスクレイピング
+    - 前処理済みCSVが存在: Step1(スクレイピング)・Step2(前処理)をスキップし学習のみ
+    - 生データPickleのみ存在: Step1(スクレイピング)をスキップし前処理→学習
+    - どちらも無い: 全ステップ実行
+
+    force=True の場合はスキップせず全ステップを実行する。
+    """
+
+    if not force and PROCESSED_DATA_PATH.exists():
+        print("検出: 前処理済みデータが存在するため Step1/2 をスキップします → 学習のみ実行")
+        artifacts = train_lightgbm()
+        return {
+            "train_auc": artifacts.train_auc,
+            "test_auc": artifacts.test_auc,
+            "best_test_auc": artifacts.best_test_auc,
+        }
+
+    if not force and RAW_DATA_PATH.exists():
+        print("検出: 生データPickleが存在するため Step1(スクレイピング) をスキップします → 前処理から実行")
+        race_results = pd.read_pickle(RAW_DATA_PATH)
+        preprocess_data(race_results)
+        artifacts = train_lightgbm()
+        return {
+            "train_auc": artifacts.train_auc,
+            "test_auc": artifacts.test_auc,
+            "best_test_auc": artifacts.best_test_auc,
+        }
+
+    # 上記に該当しなければフルパイプライン
     race_results = collect_race_data()
-    # 前処理
     preprocess_data(race_results)
-    # 学習
     artifacts = train_lightgbm()
-
     return {
         "train_auc": artifacts.train_auc,
         "test_auc": artifacts.test_auc,
         "best_test_auc": artifacts.best_test_auc,
     }
 
+
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="競馬パイプライン: スクレイピング→前処理→学習")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="既存データがあっても全ステップを実行する",
+    )
+    args = parser.parse_args()
+    main(force=args.force)

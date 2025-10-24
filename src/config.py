@@ -49,5 +49,5 @@ shutuba_table_path = 'data/processed/2024.csv'
 # 予測結果の選定方針（inference用）
 # 'top_k' なら確率上位k頭を『買うべき』にする。'threshold' なら確率が閾値以上を選定。
 prediction_strategy = 'threshold'  # 'top_k' | 'threshold'
-# prediction_top_k = 7           # 上位何頭を買うか（'top_k' のとき有効）
+prediction_top_k = 7           # 上位何頭を買うか（'top_k' のとき有効）
 prediction_threshold = 0.5     # 閾値（'threshold' のとき有効）
