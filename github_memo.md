@@ -3,5 +3,5 @@ git reset --hard origin/main
 git clean -fd
 
 git add -A
-git commit -m "delete model save while inference"
+git commit -m "change file cofiguration"
 git push origin main

@@ -1,7 +1,7 @@
 競馬AI
 ===========
 
-競馬レースの過去データをスクレイピングし、特徴量を整形して LightGBM で学習・推論まで行うプロジェクトです。学習用の一括パイプラインは `building.py`、最新の出馬表からの推論は `inference.py` で実行できます。
+競馬レースの過去データをスクレイピングし、特徴量を整形して LightGBM で学習・推論まで行うプロジェクトです。学習用の一括パイプラインは `scripts/train.py`、最新の出馬表からの推論は `scripts/infer.py` で実行できます。
 
 
 **主な機能**
@@ -12,9 +12,9 @@
 
 
 **プロジェクト構成**
-- `building.py:1` – スクレイピング→前処理→学習をまとめて実行するエントリポイント
-- `inference.py:1` – 出馬表をスクレイピングし、学習済みモデルで推論
-- `src/config.py:1` – レース名・レースIDリスト・使用特徴量に加え、推論用の `model_path`/`race_id`/`shutuba_table_path` を設定
+- `scripts/train.py:1` – スクレイピング→前処理→学習をまとめて実行するエントリポイント
+- `scripts/infer.py:1` – 出馬表をスクレイピングし、学習済みモデルで推論
+- `src/config.py:1` – レース名・レースIDリスト・使用特徴量に加え、推論用の `model_path`/`race_id` を設定
 - `src/scraping.py:1` – レース結果・馬成績（平均賞金/平均着順）のスクレイピング
 - `src/processing.py:1` – 生データから学習用特徴量へ整形
 - `src/modeling/light_gbm.py:1` – LightGBM 学習・評価・モデル保存
@@ -39,7 +39,7 @@
   brew install libomp
   ```
 
-- 推論（`inference.py`）には Google Chrome と ChromeDriver が必要（ヘッドレス動作）
+- 推論（`scripts/infer.py`）には Google Chrome と ChromeDriver が必要（ヘッドレス動作）
   
   - macOS: `brew install --cask google-chrome`、`brew install chromedriver`
   - Chrome と ChromeDriver のバージョンを一致させ、`chromedriver` が `PATH` にあることを確認
@@ -51,7 +51,7 @@
 **1) 学習パイプラインを一括実行**
 
 ```bash
-python building.py
+python scripts/train.py
 ```
 
 - 主要出力
@@ -63,14 +63,14 @@ python building.py
 **2) 最新の出馬表から推論のみ実行**
 
 ```bash
-python inference.py
+python scripts/infer.py
 ```
 
 - 主要挙動
   - 出馬表（`race_id` は `src/config.py`）を Selenium で取得
   - `src/scraping.py` の馬成績スクレイピングから「平均賞金」「平均着順」を付与
-- `model_path`（`src/config.py`）で指定した学習済みモデルを読み込み、三着以内確率を推定
-- 予想順位・確率・馬番・馬名・単勝オッズ・実際の人気を一覧表示
+  - `model_path`（`src/config.py`）で指定した学習済みモデルを読み込み、三着以内確率を推定
+  - 予想順位・確率・馬番・馬名・単勝オッズ・実際の人気を一覧表示
 
 ### 判定ロジックの切り替え
 
@@ -79,12 +79,12 @@ python inference.py
 ```
 # 'top_k' なら確率上位k頭を『買うべき』にする。'threshold' なら確率が閾値以上を選定。
 prediction_strategy = 'top_k'  # 'top_k' | 'threshold'
-prediction_top_k = 3           # 上位何頭を買うか（'top_k' のとき有効）
-prediction_threshold = 0.5     # 閾値（'threshold' のとき有効）
+prediction_top_k = 5           # 上位何頭を買うか（'top_k' のとき有効）
+prediction_threshold = 0.3     # 閾値（'threshold' のとき有効）。18頭立ての事前確率 ~3/18 を目安に設定
 ```
 
-レースは常に「3頭が三着以内に入る」前提のため、初期値は `top_k=3` を採用しています。固定閾値0.5で全頭『買うべきでない』が並ぶ状況を避け、来る可能性が高い上位馬を確実に拾います。閾値方式を使う場合は、事前確率（例: 18頭立てなら約3/18=0.17）を目安に `prediction_threshold` を調整してください。
-  - 取得した出馬表は `shutuba_table_path`（`src/config.py`）に保存
+初期値は、総頭数と事前確率を意識して `top_k=5`・`threshold=0.3` にしています。固定閾値方式を使う場合は、事前確率（例: 18頭立てなら約3/18≈0.17）を目安に `prediction_threshold` を調整してください。
+  
 
 **3) ステップを個別に実行**
 
@@ -102,13 +102,12 @@ prediction_threshold = 0.5     # 閾値（'threshold' のとき有効）
 - `race_id_list` – 取得対象レースIDの配列。netkeiba のレース詳細URLの `race_id` を指定（例: `202408050611`）
 - `feature_columns` – 学習用に使用する列の順序。既定: `着順, 馬番, 単勝, 人 気, 馬の体重, 体重変化, 平均賞金, 平均着順`
 
-推論関連の設定（`inference.py` が参照）
+推論関連の設定（`scripts/infer.py` が参照）
 
 - `model_path` – 学習済みモデル（Joblib）の読み込み先
 - `race_id` – 出馬表スクレイピング対象のレースID
-- `shutuba_table_path` – 取得した出馬表CSVの保存先
 
-メモ: `building.py` は既定で `data/models/LightBGMモデル.joblib` に保存します。`model_path` を変更する場合は、保存先と読み込み先が一致するように調整してください。
+メモ: `scripts/train.py` は既定で `data/models/LightBGMモデル.joblib` に保存します。`model_path` を変更する場合は、保存先と読み込み先が一致するように調整してください。
 
 注意: 生データには全角スペースを含む列（例: `着 順`, `馬 番`, `人 気`）があり、`src/processing.py:1` 側で `着順/馬番` などに正規化しています。
 
