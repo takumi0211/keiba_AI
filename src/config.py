@@ -41,10 +41,7 @@ feature_columns = [
 model_path = 'data/models/LightBGMモデル.joblib'
 
 # レースID(inference用)
-race_id = '202408050611'
-
-# 出馬表パス(inference用)
-shutuba_table_path = 'data/processed/2024.csv'
+race_id = '201908040711'
 
 # 予測結果の選定方針（inference用）
 # 'top_k' なら確率上位k頭を『買うべき』にする。'threshold' なら確率が閾値以上を選定。

@@ -11,7 +11,6 @@ from src.config import (
     race_name,
     feature_columns,
     race_id,
-    shutuba_table_path,
     model_path,
     prediction_strategy,
     prediction_top_k,
@@ -221,9 +220,6 @@ def main():
     
     df['平均賞金'] = df['horse_id'].map(horse_prize)
     df['平均着順'] = df['horse_id'].map(horse_rank)
-    
-    # データを保存
-    df.to_csv(shutuba_table_path, index=False)
     
     # データの前処理
     print("データを前処理中...")
