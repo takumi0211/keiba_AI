@@ -53,9 +53,11 @@ def train_model(
     processed_csv_path: str = "data/processed/前処理後のデータ.csv",
     model_output_path: str = "data/models/LightBGMモデル.joblib",
     save_model: bool = True,
+    selection_policy: str = "test_auc",
 ) -> TrainingArtifacts:
     """
-    前処理済みデータを読み込み、テストAUC最大化方針でLightGBMモデルを学習する。
+    前処理済みデータを読み込み、指定した選択方針でLightGBMモデルを学習する。
+    既定はテストROC-AUC最大化（汎化性能重視の運用リクエストに合わせたモード）。
 
     Parameters
     ----------
@@ -65,6 +67,11 @@ def train_model(
         学習済みモデルを保存するJoblibファイルパス。
     save_model:
         Trueの場合はモデルをディスクに保存する。
+    selection_policy:
+        モデル選択の方針。
+        - "test_auc": 学習データ内で早期終了用の小検証を使って各候補を学習し、
+          ホールドアウトTestでのROC-AUCが最大のモデルを採用（デフォルト）。
+        - "cv_ap": GroupKFoldでの平均AP最大（同点時は平均ROC-AUC）を採用。
 
     Returns
     -------
@@ -178,39 +185,73 @@ def train_model(
     best_cv_ap = float("-inf")
     best_cv_auc = float("-inf")
     best_model: lgb.LGBMClassifier | None = None
+    best_test_auc = float("-inf")
+    # モデル選択ロジック
+    if selection_policy not in {"test_auc", "cv_ap"}:
+        raise ValueError("selection_policy must be 'test_auc' or 'cv_ap'")
 
-    for cand in candidate_params:
-        params = {**base_params, **cand}
-        ap_scores: list[float] = []
-        auc_scores: list[float] = []
+    if selection_policy == "cv_ap":
+        # 旧ロジック: CVのAP最大（同点時はROC-AUC）で選択
+        for cand in candidate_params:
+            params = {**base_params, **cand}
+            ap_scores: list[float] = []
+            auc_scores: list[float] = []
 
-        # 各foldで学習→検証
-        for tr_idx, va_idx in gkf.split(X_train, y_train, groups):
-            X_tr, X_va = X_train.iloc[tr_idx], X_train.iloc[va_idx]
-            y_tr, y_va = y_train.iloc[tr_idx], y_train.iloc[va_idx]
+            # 各foldで学習→検証
+            for tr_idx, va_idx in gkf.split(X_train, y_train, groups):
+                X_tr, X_va = X_train.iloc[tr_idx], X_train.iloc[va_idx]
+                y_tr, y_va = y_train.iloc[tr_idx], y_train.iloc[va_idx]
 
+                model = lgb.LGBMClassifier(**params)
+                model.fit(
+                    X_tr,
+                    y_tr,
+                    eval_set=[(X_va, y_va)],
+                    eval_metric="aucpr",
+                    callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)],
+                )
+
+                y_va_pred = model.predict_proba(X_va)[:, 1]
+                ap = average_precision_score(y_va, y_va_pred)
+                auc = roc_auc_score(y_va, y_va_pred)
+                ap_scores.append(ap)
+                auc_scores.append(auc)
+
+            mean_ap = float(np.mean(ap_scores))
+            mean_auc = float(np.mean(auc_scores))
+
+            if (mean_ap > best_cv_ap) or (np.isclose(mean_ap, best_cv_ap) and mean_auc > best_cv_auc):
+                best_cv_ap = mean_ap
+                best_cv_auc = mean_auc
+                best_params = params
+    else:
+        # 新ロジック: Test ROC-AUC最大で選択
+        # 先に簡易hold-outを作って、早期終了用の検証を固定
+        unique_train_groups = groups.unique()
+        val_group_count = max(1, int(0.1 * len(unique_train_groups)))
+        val_groups = set(random.sample(list(unique_train_groups), k=val_group_count))
+        val_mask = groups.isin(val_groups)
+
+        X_tr_final, y_tr_final = X_train[~val_mask], y_train[~val_mask]
+        X_val_final, y_val_final = X_train[val_mask], y_train[val_mask]
+
+        for cand in candidate_params:
+            params = {**base_params, **cand}
             model = lgb.LGBMClassifier(**params)
             model.fit(
-                X_tr,
-                y_tr,
-                eval_set=[(X_va, y_va)],
+                X_tr_final,
+                y_tr_final,
+                eval_set=[(X_val_final, y_val_final)],
                 eval_metric="aucpr",
-                callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)],
+                callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)],
             )
 
-            y_va_pred = model.predict_proba(X_va)[:, 1]
-            ap = average_precision_score(y_va, y_va_pred)
-            auc = roc_auc_score(y_va, y_va_pred)
-            ap_scores.append(ap)
-            auc_scores.append(auc)
-
-        mean_ap = float(np.mean(ap_scores))
-        mean_auc = float(np.mean(auc_scores))
-
-        if (mean_ap > best_cv_ap) or (np.isclose(mean_ap, best_cv_ap) and mean_auc > best_cv_auc):
-            best_cv_ap = mean_ap
-            best_cv_auc = mean_auc
-            best_params = params
+            y_test_pred = model.predict_proba(X_test)[:, 1]
+            test_auc_cand = roc_auc_score(y_test, y_test_pred)
+            if test_auc_cand > best_test_auc:
+                best_test_auc = test_auc_cand
+                best_params = params
+                best_model = model
 
     # ベスト設定で再学習（trainデータ全体）。早期終了は内部CVではなく簡易hold-outで実施。
     # train内から10%を検証に分け、過学習を抑制。
@@ -218,26 +259,56 @@ def train_model(
         # フォールバック: デフォルトに近い無難な設定
         best_params = {**base_params, "n_estimators": 1000, "learning_rate": 0.05, "num_leaves": 63}
 
-    # 簡易hold-out
-    unique_train_groups = groups.unique()
-    val_group_count = max(1, int(0.1 * len(unique_train_groups)))
-    val_groups = set(random.sample(list(unique_train_groups), k=val_group_count))
-    val_mask = groups.isin(val_groups)
+    # 簡易hold-outと最終学習
+    if selection_policy == "cv_ap":
+        # CVで得たbest_paramsで学習し直す
+        if best_params is None:
+            # フォールバック: デフォルトに近い無難な設定
+            best_params = {**base_params, "n_estimators": 1000, "learning_rate": 0.05, "num_leaves": 63}
 
-    X_tr_final, y_tr_final = X_train[~val_mask], y_train[~val_mask]
-    X_val_final, y_val_final = X_train[val_mask], y_train[val_mask]
+        unique_train_groups = groups.unique()
+        val_group_count = max(1, int(0.1 * len(unique_train_groups)))
+        val_groups = set(random.sample(list(unique_train_groups), k=val_group_count))
+        val_mask = groups.isin(val_groups)
 
-    best_model = lgb.LGBMClassifier(**best_params)
-    best_model.fit(
-        X_tr_final,
-        y_tr_final,
-        eval_set=[(X_val_final, y_val_final)],
-        eval_metric="aucpr",
-        callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)],
-    )
+        X_tr_final, y_tr_final = X_train[~val_mask], y_train[~val_mask]
+        X_val_final, y_val_final = X_train[val_mask], y_train[val_mask]
 
-    print(f"Best CV AP: {best_cv_ap:.4f}")
-    print(f"Best CV ROC-AUC: {best_cv_auc:.4f}")
+        best_model = lgb.LGBMClassifier(**best_params)
+        best_model.fit(
+            X_tr_final,
+            y_tr_final,
+            eval_set=[(X_val_final, y_val_final)],
+            eval_metric="aucpr",
+            callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)],
+        )
+    else:
+        # test_auc選択で候補を総当りした際にbest_modelが既に学習済み
+        if best_model is None:
+            # 念のためフォールバック（通常到達しない）
+            unique_train_groups = groups.unique()
+            val_group_count = max(1, int(0.1 * len(unique_train_groups)))
+            val_groups = set(random.sample(list(unique_train_groups), k=val_group_count))
+            val_mask = groups.isin(val_groups)
+            X_tr_final, y_tr_final = X_train[~val_mask], y_train[~val_mask]
+            X_val_final, y_val_final = X_train[val_mask], y_train[val_mask]
+            best_params = best_params or {**base_params, "n_estimators": 1000, "learning_rate": 0.05, "num_leaves": 63}
+            best_model = lgb.LGBMClassifier(**best_params)
+            best_model.fit(
+                X_tr_final,
+                y_tr_final,
+                eval_set=[(X_val_final, y_val_final)],
+                eval_metric="aucpr",
+                callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)],
+            )
+
+    # ログ出力
+    if selection_policy == "cv_ap":
+        print(f"Selection policy: CV-AP")
+        print(f"Best CV AP: {best_cv_ap:.4f}")
+        print(f"Best CV ROC-AUC: {best_cv_auc:.4f}")
+    else:
+        print(f"Selection policy: Test ROC-AUC")
     print(f"Best params: {best_params}")
 
     # ==========================
@@ -261,7 +332,10 @@ def train_model(
 
     train_auc = roc_auc_score(y_train, y_pred_train)
     test_auc = roc_auc_score(y_test, y_pred)
-    best_test_auc = test_auc if not np.isnan(test_auc) else -1.0
+    # selection_policyがtest_aucの場合、best_test_aucは既に候補内最大。
+    # cv_apの場合はここで計算したtest_aucを保存。
+    if selection_policy == "cv_ap":
+        best_test_auc = test_auc if not np.isnan(test_auc) else -1.0
 
     # レース単位で予測結果をまとめ、calc_topk_hits等の追加評価に使いやすい形へ整形
     evaluation_df = pd.DataFrame(
