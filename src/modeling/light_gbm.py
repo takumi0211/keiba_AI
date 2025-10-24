@@ -1,5 +1,5 @@
 """
-菊花賞などの競馬データを用いてLightGBMモデルを学習し、推論結果とモデルファイルを生成するスクリプト。
+競馬データを用いてLightGBMモデルを学習し、推論結果とモデルファイルを生成するスクリプト。
 学習→評価→特徴量重要度の出力→モデル保存までを一気通貫で実行できる。
 """
 
@@ -10,11 +10,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict
 
+import numpy as np
 import pandas as pd
 
 import lightgbm as lgb
-from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import ParameterGrid, train_test_split
+from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.model_selection import ParameterGrid, GroupKFold, train_test_split
 
 
 @dataclass
@@ -22,6 +23,7 @@ class TrainingArtifacts:
     model: lgb.LGBMClassifier
     best_params: Dict[str, Any]
     best_test_auc: float
+    best_cv_ap: float
     train_auc: float
     test_auc: float
     evaluation_df: pd.DataFrame
@@ -108,71 +110,138 @@ def train_model(
     horse_test = horse_numbers[test_mask]
 
     # ==========================
-    # ハイパーパラメータ探索
+    # ハイパーパラメータ探索（CV・グループ分割・AP最適化）
     # ==========================
-    # ParameterGridで全候補を生成し、件数が多すぎる場合はランダムサンプリングで最大200件に制限。
-    # ここではテストセットのAUCを直接最大化する方針（※本来は外部データで評価すべきだが、要望に合わせた実装）。
-    param_grid = list(
-        ParameterGrid(
-            {
-                "num_leaves": [7, 15],
-                "max_depth": [3, -1],
-                "min_child_samples": [15, 30, 60],
-                "subsample": [0.7, 0.9],
-                "colsample_bytree": [0.7, 0.9],
-                "n_estimators": [200, 400],
-                "learning_rate": [0.03, 0.05],
-                "reg_alpha": [0.0, 0.3],
-                "reg_lambda": [0.5, 1.5],
-            }
-        )
+    # 目的: 「各レースで3頭だけが当たり」という不均衡性に合わせ、
+    #       AUC(ROC)よりも Positiveクラスの検出に敏感な Average Precision (AUC-PR) を最大化。
+    # 分割: 同一レースIDがfoldを跨がないよう GroupKFold を使用。
+    # 早期終了: 各foldの検証データで early_stopping。
+
+    # 学習データの不均衡を重みで補正
+    pos = int(y_train.sum())
+    neg = int((~y_train.astype(bool)).sum())
+    scale_pos_weight = (neg / max(pos, 1)) if pos > 0 else 1.0
+
+    rng = np.random.default_rng(1234)
+
+    def sample_params(n: int = 40) -> list[dict[str, Any]]:
+        samples: list[dict[str, Any]] = []
+        for _ in range(n):
+            num_leaves = int(rng.integers(16, 96))
+            max_depth = int(rng.choice([-1, 4, 6, 8, 10]))
+            min_child_samples = int(rng.choice([10, 20, 40, 80, 120]))
+            subsample = float(rng.uniform(0.6, 1.0))
+            colsample_bytree = float(rng.uniform(0.6, 1.0))
+            learning_rate = float(10 ** rng.uniform(np.log10(0.01), np.log10(0.2)))
+            reg_alpha = float(10 ** rng.uniform(np.log10(1e-3), np.log10(10)))
+            reg_lambda = float(10 ** rng.uniform(np.log10(1e-3), np.log10(10)))
+            n_estimators = int(rng.integers(600, 1800))
+            samples.append(
+                {
+                    "num_leaves": num_leaves,
+                    "max_depth": max_depth,
+                    "min_child_samples": min_child_samples,
+                    "subsample": subsample,
+                    "colsample_bytree": colsample_bytree,
+                    "learning_rate": learning_rate,
+                    "reg_alpha": reg_alpha,
+                    "reg_lambda": reg_lambda,
+                    "n_estimators": n_estimators,
+                }
+            )
+        return samples
+
+    # CV設定（レース単位で分割）
+    gkf = GroupKFold(n_splits=5)
+    groups = race_ids[train_mask]
+
+    # LightGBMのベース設定
+    base_params = {
+        "random_state": 12,
+        "objective": "binary",
+        "n_jobs": -1,
+        "scale_pos_weight": scale_pos_weight,
+    }
+
+    candidate_params = sample_params(40)
+    best_params: dict[str, Any] | None = None
+    best_cv_ap = float("-inf")
+    best_cv_auc = float("-inf")
+    best_model: lgb.LGBMClassifier | None = None
+
+    for cand in candidate_params:
+        params = {**base_params, **cand}
+        ap_scores: list[float] = []
+        auc_scores: list[float] = []
+
+        # 各foldで学習→検証
+        for tr_idx, va_idx in gkf.split(X_train, y_train, groups):
+            X_tr, X_va = X_train.iloc[tr_idx], X_train.iloc[va_idx]
+            y_tr, y_va = y_train.iloc[tr_idx], y_train.iloc[va_idx]
+
+            model = lgb.LGBMClassifier(**params)
+            model.fit(
+                X_tr,
+                y_tr,
+                eval_set=[(X_va, y_va)],
+                eval_metric="aucpr",
+                callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)],
+            )
+
+            y_va_pred = model.predict_proba(X_va)[:, 1]
+            ap = average_precision_score(y_va, y_va_pred)
+            auc = roc_auc_score(y_va, y_va_pred)
+            ap_scores.append(ap)
+            auc_scores.append(auc)
+
+        mean_ap = float(np.mean(ap_scores))
+        mean_auc = float(np.mean(auc_scores))
+
+        if (mean_ap > best_cv_ap) or (np.isclose(mean_ap, best_cv_ap) and mean_auc > best_cv_auc):
+            best_cv_ap = mean_ap
+            best_cv_auc = mean_auc
+            best_params = params
+
+    # ベスト設定で再学習（trainデータ全体）。早期終了は内部CVではなく簡易hold-outで実施。
+    # train内から10%を検証に分け、過学習を抑制。
+    if best_params is None:
+        # フォールバック: デフォルトに近い無難な設定
+        best_params = {**base_params, "n_estimators": 1000, "learning_rate": 0.05, "num_leaves": 63}
+
+    # 簡易hold-out
+    unique_train_groups = groups.unique()
+    val_group_count = max(1, int(0.1 * len(unique_train_groups)))
+    val_groups = set(random.sample(list(unique_train_groups), k=val_group_count))
+    val_mask = groups.isin(val_groups)
+
+    X_tr_final, y_tr_final = X_train[~val_mask], y_train[~val_mask]
+    X_val_final, y_val_final = X_train[val_mask], y_train[val_mask]
+
+    best_model = lgb.LGBMClassifier(**best_params)
+    best_model.fit(
+        X_tr_final,
+        y_tr_final,
+        eval_set=[(X_val_final, y_val_final)],
+        eval_metric="aucpr",
+        callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)],
     )
 
-    audit_grid = param_grid
-    if len(audit_grid) > 200:
-        audit_grid = random.sample(audit_grid, k=200)
-
-    # LightGBMのベース設定。random_stateは再現性担保のため固定。
-    base_params = {"random_state": 12, "objective": "binary"}
-    best_params: dict[str, Any] | None = None
-    best_model: lgb.LGBMClassifier | None = None
-    best_test_auc = float("-inf")
-
-    for candidate in audit_grid:
-        params = {**base_params, **candidate}
-        model = lgb.LGBMClassifier(**params)
-        model.fit(
-            X_train,
-            y_train,
-            eval_set=[(X_test, y_test)],  # テストAUC最大化のため評価先をテストに固定
-            eval_metric="auc",
-            callbacks=[lgb.early_stopping(20), lgb.log_evaluation(0)],
-        )
-        y_pred_candidate = model.predict_proba(X_test)[:, 1]
-        test_auc = roc_auc_score(y_test, y_pred_candidate)
-        if test_auc > best_test_auc:
-            best_test_auc = test_auc
-            best_params = params
-            best_model = model
-
-    print(f"Best Test AUC: {best_test_auc:.4f}")
+    print(f"Best CV AP: {best_cv_ap:.4f}")
+    print(f"Best CV ROC-AUC: {best_cv_auc:.4f}")
     print(f"Best params: {best_params}")
 
     # ==========================
     # 学習と評価
     # ==========================
-    # ループ内でテストAUC最大のモデルを保持しているため、そのまま利用。
     # 念のためtrain側のAUCも確認できるように改めて推論。
     if best_model is None:
-        # 探索候補が空だった場合のフォールバック
-        best_params = {**base_params, **audit_grid[0]}
         best_model = lgb.LGBMClassifier(**best_params)
         best_model.fit(
             X_train,
             y_train,
-            eval_set=[(X_test, y_test)],
-            eval_metric="auc",
-            callbacks=[lgb.early_stopping(20), lgb.log_evaluation(0)],
+            eval_set=[(X_val_final, y_val_final)],
+            eval_metric="aucpr",
+            callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)],
         )
 
     lgb_clf = best_model
@@ -182,8 +251,7 @@ def train_model(
 
     train_auc = roc_auc_score(y_train, y_pred_train)
     test_auc = roc_auc_score(y_test, y_pred)
-    print(train_auc)
-    print(test_auc)
+    best_test_auc = test_auc if not np.isnan(test_auc) else -1.0
 
     # レース単位で予測結果をまとめ、calc_topk_hits等の追加評価に使いやすい形へ整形
     evaluation_df = pd.DataFrame(
@@ -216,6 +284,7 @@ def train_model(
         model=lgb_clf,
         best_params=best_params or base_params,
         best_test_auc=best_test_auc,
+        best_cv_ap=best_cv_ap,
         train_auc=train_auc,
         test_auc=test_auc,
         evaluation_df=evaluation_df,

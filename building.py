@@ -70,8 +70,9 @@ def train_lightgbm() -> TrainingArtifacts:
         model_output_path=str(model_path),
         save_model=True,
     )
-    print(f"  -> Train AUC: {artifacts.train_auc:.4f}")
-    print(f"  -> Test AUC : {artifacts.test_auc:.4f}")
+    print(f"  -> Train AUC : {artifacts.train_auc:.4f}")
+    print(f"  -> Test AUC  : {artifacts.test_auc:.4f}")
+    print(f"  -> Best CV AP: {artifacts.best_cv_ap:.4f}")
     # configの model_path は文字列のため、表示用に Path へ変換
     print(f"  -> モデルを {Path(model_path).resolve()} に保存しました。")
 
@@ -95,6 +96,7 @@ def main(force: bool = False) -> Dict[str, float]:
             "train_auc": artifacts.train_auc,
             "test_auc": artifacts.test_auc,
             "best_test_auc": artifacts.best_test_auc,
+            "best_cv_ap": artifacts.best_cv_ap,
         }
 
     if not force and RAW_DATA_PATH.exists():
@@ -106,6 +108,7 @@ def main(force: bool = False) -> Dict[str, float]:
             "train_auc": artifacts.train_auc,
             "test_auc": artifacts.test_auc,
             "best_test_auc": artifacts.best_test_auc,
+            "best_cv_ap": artifacts.best_cv_ap,
         }
 
     # 上記に該当しなければフルパイプライン
@@ -116,6 +119,7 @@ def main(force: bool = False) -> Dict[str, float]:
         "train_auc": artifacts.train_auc,
         "test_auc": artifacts.test_auc,
         "best_test_auc": artifacts.best_test_auc,
+        "best_cv_ap": artifacts.best_cv_ap,
     }
 
 
