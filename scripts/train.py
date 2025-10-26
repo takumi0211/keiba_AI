@@ -78,7 +78,8 @@ def train_lightgbm() -> TrainingArtifacts:
     )
     print(f"  -> Train AUC : {artifacts.train_auc:.4f}")
     print(f"  -> Test AUC  : {artifacts.test_auc:.4f}")
-    print(f"  -> Best CV AP: {artifacts.best_cv_ap:.4f}")
+    if artifacts.best_cv_ap != float("-inf"):
+        print(f"  -> Best CV AP: {artifacts.best_cv_ap:.4f}")
     # configの model_path は文字列のため、表示用に Path へ変換
     print(f"  -> モデルを {Path(model_path).resolve()} に保存しました。")
 

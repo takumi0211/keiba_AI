@@ -1,6 +1,10 @@
 """
 競馬データを用いてLightGBMモデルを学習し、推論結果とモデルファイルを生成するスクリプト。
 学習→評価→特徴量重要度の出力→モデル保存までを一気通貫で実行できる。
+
+重要: ハイパーパラメータ選定は Train 内のみで実施し、
+テストデータは最終評価のみに使用する（リーク防止）。
+既定は GroupKFold による AP 最大化での選定。
 """
 
 from __future__ import annotations
@@ -15,7 +19,7 @@ import pandas as pd
 
 import lightgbm as lgb
 from sklearn.metrics import average_precision_score, roc_auc_score
-from sklearn.model_selection import ParameterGrid, GroupKFold, train_test_split
+from sklearn.model_selection import GroupKFold, train_test_split
 
 # 学習で利用する特徴量は config.py の `feature_columns` を参照する
 from src.config import feature_columns
@@ -53,11 +57,11 @@ def train_model(
     processed_csv_path: str = "data/processed/前処理後のデータ.csv",
     model_output_path: str = "data/models/LightBGMモデル.joblib",
     save_model: bool = True,
-    selection_policy: str = "test_auc",
+    selection_policy: str = "cv_ap",
 ) -> TrainingArtifacts:
     """
     前処理済みデータを読み込み、指定した選択方針でLightGBMモデルを学習する。
-    既定はテストROC-AUC最大化（汎化性能重視の運用リクエストに合わせたモード）。
+    既定は GroupKFold による AP 最大化（不均衡データでの検出力を重視）。
 
     Parameters
     ----------
@@ -69,9 +73,8 @@ def train_model(
         Trueの場合はモデルをディスクに保存する。
     selection_policy:
         モデル選択の方針。
-        - "test_auc": 学習データ内で早期終了用の小検証を使って各候補を学習し、
-          ホールドアウトTestでのROC-AUCが最大のモデルを採用（デフォルト）。
-        - "cv_ap": GroupKFoldでの平均AP最大（同点時は平均ROC-AUC）を採用。
+        - "cv_ap": GroupKFold での平均AP最大（同点時は平均ROC-AUC）を採用（デフォルト）
+        - "val_auc": Train 内のグループ保全ホールドアウトでの ROC-AUC 最大を採用
 
     Returns
     -------
@@ -146,9 +149,13 @@ def train_model(
         for _ in range(n):
             num_leaves = int(rng.integers(16, 96))
             max_depth = int(rng.choice([-1, 4, 6, 8, 10]))
+            # max_depth が有効なときは 2**max_depth を超えないよう制約
+            if max_depth > 0:
+                num_leaves = min(num_leaves, 2 ** max_depth)
+
             min_child_samples = int(rng.choice([10, 20, 40, 80, 120]))
-            subsample = float(rng.uniform(0.6, 1.0))
-            colsample_bytree = float(rng.uniform(0.6, 1.0))
+            bagging_fraction = float(rng.uniform(0.6, 1.0))
+            feature_fraction = float(rng.uniform(0.6, 1.0))
             learning_rate = float(10 ** rng.uniform(np.log10(0.01), np.log10(0.2)))
             reg_alpha = float(10 ** rng.uniform(np.log10(1e-3), np.log10(10)))
             reg_lambda = float(10 ** rng.uniform(np.log10(1e-3), np.log10(10)))
@@ -158,8 +165,8 @@ def train_model(
                     "num_leaves": num_leaves,
                     "max_depth": max_depth,
                     "min_child_samples": min_child_samples,
-                    "subsample": subsample,
-                    "colsample_bytree": colsample_bytree,
+                    "bagging_fraction": bagging_fraction,
+                    "feature_fraction": feature_fraction,
                     "learning_rate": learning_rate,
                     "reg_alpha": reg_alpha,
                     "reg_lambda": reg_lambda,
@@ -178,6 +185,8 @@ def train_model(
         "objective": "binary",
         "n_jobs": -1,
         "scale_pos_weight": scale_pos_weight,
+        # bagging_fraction を使う場合の推奨設定
+        "bagging_freq": 1,
     }
 
     candidate_params = sample_params(40)
@@ -187,8 +196,8 @@ def train_model(
     best_model: lgb.LGBMClassifier | None = None
     best_test_auc = float("-inf")
     # モデル選択ロジック
-    if selection_policy not in {"test_auc", "cv_ap"}:
-        raise ValueError("selection_policy must be 'test_auc' or 'cv_ap'")
+    if selection_policy not in {"val_auc", "cv_ap"}:
+        raise ValueError("selection_policy must be 'val_auc' or 'cv_ap'")
 
     if selection_policy == "cv_ap":
         # 旧ロジック: CVのAP最大（同点時はROC-AUC）で選択
@@ -225,8 +234,8 @@ def train_model(
                 best_cv_auc = mean_auc
                 best_params = params
     else:
-        # 新ロジック: Test ROC-AUC最大で選択
-        # 先に簡易hold-outを作って、早期終了用の検証を固定
+        # Val ROC-AUC 最大で選択（テストデータは使わない）
+        # 先に簡易hold-outを作って、早期終了用の検証を固定（グループ保全）
         unique_train_groups = groups.unique()
         val_group_count = max(1, int(0.1 * len(unique_train_groups)))
         val_groups = set(random.sample(list(unique_train_groups), k=val_group_count))
@@ -234,6 +243,7 @@ def train_model(
 
         X_tr_final, y_tr_final = X_train[~val_mask], y_train[~val_mask]
         X_val_final, y_val_final = X_train[val_mask], y_train[val_mask]
+        best_val_auc = float("-inf")
 
         for cand in candidate_params:
             params = {**base_params, **cand}
@@ -246,10 +256,10 @@ def train_model(
                 callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)],
             )
 
-            y_test_pred = model.predict_proba(X_test)[:, 1]
-            test_auc_cand = roc_auc_score(y_test, y_test_pred)
-            if test_auc_cand > best_test_auc:
-                best_test_auc = test_auc_cand
+            y_val_pred = model.predict_proba(X_val_final)[:, 1]
+            val_auc_cand = roc_auc_score(y_val_final, y_val_pred)
+            if val_auc_cand > best_val_auc:
+                best_val_auc = val_auc_cand
                 best_params = params
                 best_model = model
 
@@ -283,7 +293,7 @@ def train_model(
             callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)],
         )
     else:
-        # test_auc選択で候補を総当りした際にbest_modelが既に学習済み
+        # val_auc 選択で候補を総当りした際に best_model が既に学習済み
         if best_model is None:
             # 念のためフォールバック（通常到達しない）
             unique_train_groups = groups.unique()
@@ -308,7 +318,7 @@ def train_model(
         print(f"Best CV AP: {best_cv_ap:.4f}")
         print(f"Best CV ROC-AUC: {best_cv_auc:.4f}")
     else:
-        print(f"Selection policy: Test ROC-AUC")
+        print(f"Selection policy: Val ROC-AUC")
     print(f"Best params: {best_params}")
 
     # ==========================
@@ -332,10 +342,8 @@ def train_model(
 
     train_auc = roc_auc_score(y_train, y_pred_train)
     test_auc = roc_auc_score(y_test, y_pred)
-    # selection_policyがtest_aucの場合、best_test_aucは既に候補内最大。
-    # cv_apの場合はここで計算したtest_aucを保存。
-    if selection_policy == "cv_ap":
-        best_test_auc = test_auc if not np.isnan(test_auc) else -1.0
+    # 最終的な test_auc を記録（選定方針に依らず同一の扱い）
+    best_test_auc = test_auc if not np.isnan(test_auc) else -1.0
 
     # レース単位で予測結果をまとめ、calc_topk_hits等の追加評価に使いやすい形へ整形
     evaluation_df = pd.DataFrame(
